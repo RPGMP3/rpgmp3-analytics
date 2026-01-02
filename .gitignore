@@ -39,3 +39,8 @@ data/
 # Postgres dumps
 *.sql.dump
 
+# Packaging/build artifacts
+*.egg-info/
+build/
+dist/
+
