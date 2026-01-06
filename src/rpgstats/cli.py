@@ -1,3 +1,5 @@
+# src/rpgstats/cli.py
+
 from pathlib import Path
 import time
 
@@ -9,7 +11,11 @@ from rpgstats.db.connect import get_conn
 from rpgstats.crawl.sitemap import fetch_sitemap
 from rpgstats.db.upsert import upsert_raw_post
 
-from rpgstats.db.raw_posts import get_posts_needing_extract, update_post_extracted
+from rpgstats.db.raw_posts import (
+    get_posts_needing_extract,
+    update_post_extracted,
+    mark_extract_error,
+)
 from rpgstats.crawl.extract_post import extract_post_fields
 
 from rpgstats.analytics.stats import (
@@ -17,9 +23,38 @@ from rpgstats.analytics.stats import (
     top_groups_by_hours,
     top_authors_by_hours,
     missing_duration_urls,
+    top_systems_by_hours,
+    top_systems_by_count,
+    top_group_system_pairs,
+    top_campaigns_by_hours,
+    top_group_campaign_pairs,
 )
 
 app = typer.Typer(help="RPGMP3 analytics CLI")
+
+
+def _format_seconds(total_seconds: int) -> tuple[str, str]:
+    """
+    Returns:
+      (pretty_wdhm, minutes_seconds)
+
+    pretty_wdhm example:
+      "27w 3d 09h 58m"   (weeks, days, hours, minutes)
+
+    minutes_seconds example:
+      "277078m 13s"
+    """
+    if total_seconds < 0:
+        total_seconds = 0
+
+    total_minutes, seconds = divmod(total_seconds, 60)
+    hours, minutes = divmod(total_minutes, 60)
+    days, hours = divmod(hours, 24)
+    weeks, days = divmod(days, 7)
+
+    pretty = f"{weeks}w {days}d {hours:02d}h {minutes:02d}m"
+    minsec = f"{total_minutes}m {seconds:02d}s"
+    return pretty, minsec
 
 
 @app.callback()
@@ -105,6 +140,12 @@ def _run_extract_batch(client: httpx.Client, limit: int, sleep_ms: int) -> tuple
             )
 
         except Exception as e:
+            # Mark as attempted so --until-empty doesn't loop forever on the same URLs
+            try:
+                mark_extract_error(row.url, str(e))
+            except Exception:
+                # If DB write fails, still show the original error.
+                pass
             print(f"[red]{i}/{len(rows)}[/red] {row.url} -> error: {e}")
 
         time.sleep(sleep_ms / 1000)
@@ -173,13 +214,23 @@ def stats(limit: int = 10):
     Print a terminal stats report (sessions are inferred by URL containing session-<number>).
     """
     s = get_summary()
+    all_pretty, all_minsec = _format_seconds(s.total_seconds_all)
+    ses_pretty, ses_minsec = _format_seconds(s.total_seconds_sessions)
 
     print("\n[bold]RPGMP3 Stats[/bold]")
     print(f"Total posts: [bold]{s.total_posts}[/bold]")
     print(f"With duration: [bold]{s.with_duration}[/bold]")
     print(f"Missing duration: [bold]{s.missing_duration}[/bold]")
-    print(f"Total hours (all content with duration): [bold]{s.total_hours_all:.2f}[/bold]")
-    print(f"Total hours (sessions only, heuristic): [bold]{s.total_hours_sessions:.2f}[/bold]\n")
+
+    print("\n[bold]Total runtime (all content with duration)[/bold]")
+    print(f"- Hours: [bold]{s.total_hours_all:.2f}[/bold]")
+    print(f"- W/D/H/M: [bold]{all_pretty}[/bold]")
+    print(f"- Minutes+seconds: [bold]{all_minsec}[/bold]")
+
+    print("\n[bold]Total runtime (sessions only, heuristic)[/bold]")
+    print(f"- Hours: [bold]{s.total_hours_sessions:.2f}[/bold]")
+    print(f"- W/D/H/M: [bold]{ses_pretty}[/bold]")
+    print(f"- Minutes+seconds: [bold]{ses_minsec}[/bold]\n")
 
     print(f"[bold]Top Groups by Session Hours (limit {limit})[/bold]")
     for name, hours, items in top_groups_by_hours(limit):
@@ -188,6 +239,27 @@ def stats(limit: int = 10):
     print(f"\n[bold]Top Authors by Session Hours (limit {limit})[/bold]")
     for name, hours, items in top_authors_by_hours(limit):
         print(f"- {name}: {hours:.2f} hours ({items} items)")
+
+    print(f"\n[bold]Top Systems by Session Hours (limit {limit})[/bold]")
+    for system, hours, sessions in top_systems_by_hours(limit):
+        print(f"- {system}: {hours:.2f} hours ({sessions} sessions)")
+
+    print(f"\n[bold]Top Systems by Session Count (limit {limit})[/bold]")
+    for system, sessions, hours in top_systems_by_count(limit):
+        print(f"- {system}: {sessions} sessions ({hours:.2f} hours)")
+
+    print(f"\n[bold]Top Group+System Pairs by Session Hours (limit {limit})[/bold]")
+    for group, system, hours, sessions in top_group_system_pairs(limit):
+        print(f"- {group} — {system}: {hours:.2f} hours ({sessions} sessions)")
+
+    print(f"\n[bold]Top Campaigns by Session Hours (limit {limit})[/bold]")
+    for campaign, hours, sessions in top_campaigns_by_hours(limit):
+        print(f"- {campaign}: {hours:.2f} hours ({sessions} sessions)")
+
+    print(f"\n[bold]Top Group+Campaign Pairs by Session Hours (limit {limit})[/bold]")
+    for group, campaign, hours, sessions in top_group_campaign_pairs(limit):
+        print(f"- {group} — {campaign}: {hours:.2f} hours ({sessions} sessions)")
+
     print("")
 
 

@@ -19,28 +19,22 @@ def get_posts_needing_extract(limit: int) -> list[RawPostRow]:
     """
     Fetch a batch of URLs that still need metadata extraction.
 
-    We include rows missing any of:
-    - duration_seconds
-    - tags
-    - author
-    - group_name
-    - system_name
-    - campaign_name
-
-    Ordered by lastmod desc so we tend to process recent posts first.
+    IMPORTANT:
+    - We only select rows that have never been attempted (extracted_at is null).
+      This prevents infinite loops on rows where certain fields can't be derived.
     """
     sql = """
     select url, lastmod
     from raw_posts
-    where duration_seconds is null
-       or tags is null
-       or author is null
-       or group_name is null
-       or group_name = ''
-       or system_name is null
-       or system_name = ''
-       or campaign_name is null
-       or campaign_name = ''
+    where extracted_at is null
+      and (
+        duration_seconds is null
+        or tags is null
+        or author is null
+        or group_name is null or group_name = ''
+        or system_name is null or system_name = ''
+        or campaign_name is null or campaign_name = ''
+      )
     order by lastmod desc nulls last
     limit %s
     """
@@ -51,6 +45,24 @@ def get_posts_needing_extract(limit: int) -> list[RawPostRow]:
             rows = cur.fetchall()
 
     return [RawPostRow(url=r[0], lastmod=r[1]) for r in rows]
+
+
+def mark_extract_error(url: str, error: str) -> None:
+    """
+    Mark that we attempted extraction but hit an error.
+    This prevents immediate re-tries during --until-empty runs.
+    """
+    sql = """
+    update raw_posts
+    set extracted_at = now(),
+        extract_attempts = extract_attempts + 1,
+        last_extract_error = left(%s, 2000)
+    where url = %s
+    """
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(sql, (error, url))
+        conn.commit()
 
 
 def update_post_extracted(
@@ -73,8 +85,7 @@ def update_post_extracted(
     Notes:
     - Uses COALESCE so we don't overwrite existing values with NULL.
     - Uses NULLIF for text fields so empty strings don't block later backfills.
-    - Casts numeric placeholders (::int, ::bigint) to avoid Postgres type inference
-      errors when values are NULL.
+    - Stamps extracted_at + increments extract_attempts to prevent infinite retry loops.
     """
     sql = """
     update raw_posts
@@ -95,7 +106,11 @@ def update_post_extracted(
 
         download_url = coalesce(nullif(%s, ''), download_url),
         file_size_bytes = coalesce(%s::bigint, file_size_bytes),
-        youtube_urls = coalesce(%s, youtube_urls)
+        youtube_urls = coalesce(%s, youtube_urls),
+
+        extracted_at = now(),
+        extract_attempts = extract_attempts + 1,
+        last_extract_error = null
 
     where url = %s
     """
