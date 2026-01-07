@@ -1,3 +1,7 @@
+# src/rpgstats/crawl/extract_post.py
+
+from __future__ import annotations
+
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -8,13 +12,33 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 # Matches: Duration: 2:08:54 OR Duration: 48:12
-DURATION_RE = re.compile(r"Duration:\s*([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)")
+DURATION_RE = re.compile(r"Duration:\s*([0-9]{1,2}:[0-9]{2}(?::[0-9]{2})?)", re.IGNORECASE)
 # Matches: — 69.6MB or - 69.6MB
 SIZE_RE = re.compile(r"[—-]\s*([0-9.]+)\s*(KB|MB|GB)\b", re.IGNORECASE)
-
 PAREN_RE = re.compile(r"\(([^)]+)\)")
 SESSION_NUM_RE = re.compile(r"\bSession\s+\d+\b", re.IGNORECASE)
 SLUG_SESSION_RE = re.compile(r"-session-\d+/?$", re.IGNORECASE)
+
+# Remove recording artifacts from inferred campaign names
+BAD_CAMPAIGN_SUFFIX_RE = re.compile(
+    r"""
+    \b(
+        session\s*\d+[a-z]? |      # Session 44, Session 03a
+        part\s*\d+ |               # Part 2
+        character\s+creation |     # Character Creation
+        sfx |                      # Sfx
+        \d+[a-z]?                  # trailing 2, b, 03a
+    )\b
+    """,
+    re.IGNORECASE | re.VERBOSE,
+)
+
+# If we ever infer a "campaign" that is exactly one of these, drop it.
+# (This is conservative; feel free to add more later.)
+BAD_CAMPAIGN_EXACT = {
+    "session",
+    "part",
+}
 
 
 def _hms_to_seconds(s: str) -> int:
@@ -34,12 +58,18 @@ def _size_to_bytes(num: float, unit: str) -> int:
     return int(num * mult)
 
 
+def _data_path(filename: str) -> Path:
+    # this file: src/rpgstats/crawl/extract_post.py
+    # data dir:  src/rpgstats/data/
+    return Path(__file__).resolve().parents[1] / "data" / filename
+
+
 def _read_list_file(filename: str) -> list[str]:
     """
     Read a list file from src/rpgstats/data/<filename>, one item per line.
     Lines starting with # are ignored.
     """
-    path = Path(__file__).resolve().parents[1] / "data" / filename
+    path = _data_path(filename)
     if not path.exists():
         return []
     lines = path.read_text(encoding="utf-8").splitlines()
@@ -52,6 +82,72 @@ def load_known_groups() -> list[str]:
 
 def load_known_systems() -> list[str]:
     return _read_list_file("systems.txt")
+
+
+def load_campaign_aliases() -> dict[str, str]:
+    """
+    Load campaign aliases from src/rpgstats/data/campaign_aliases.txt
+
+    Format:
+      FROM => TO
+
+    Matching is case-insensitive on FROM.
+    """
+    path = _data_path("campaign_aliases.txt")
+    if not path.exists():
+        return {}
+
+    aliases: dict[str, str] = {}
+    for raw in path.read_text(encoding="utf-8").splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=>" not in line:
+            continue
+        left, right = line.split("=>", 1)
+        frm = left.strip()
+        to = right.strip()
+        if frm and to:
+            aliases[frm.casefold()] = to
+    return aliases
+
+
+def normalize_campaign_name(name: str | None) -> str | None:
+    """
+    Normalize campaign name using campaign_aliases.txt (if present).
+    """
+    if not name:
+        return None
+    aliases = load_campaign_aliases()
+    if not aliases:
+        return name
+    return aliases.get(name.casefold(), name)
+
+
+def clean_campaign_name(name: str | None) -> str | None:
+    """
+    Remove recording artifacts like:
+      "Kingmaker Session 44 2" -> "Kingmaker"
+      "The One Ring ... Session 03a" -> "The One Ring ..."
+      "Session 00 Character Creation" -> "" (None)
+    """
+    if not name:
+        return None
+
+    cleaned = BAD_CAMPAIGN_SUFFIX_RE.sub("", name)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -–—:")
+
+    if not cleaned:
+        return None
+
+    if cleaned.casefold() in BAD_CAMPAIGN_EXACT:
+        return None
+
+    # Too-short campaign names after cleaning usually mean "we stripped everything useful"
+    if len(cleaned) < 3:
+        return None
+
+    return cleaned
 
 
 def infer_group_name(tags: list[str] | None, page_text: str | None = None) -> str | None:
@@ -126,16 +222,15 @@ def infer_campaign_from_url(url: str | None) -> str | None:
         return None
 
     slug = path.split("/")[-1].lower().strip()
-    # strip trailing slash already handled by strip("/")
-    # remove "-session-N"
     slug = SLUG_SESSION_RE.sub("", slug).strip("-")
     if not slug:
         return None
 
-    # Turn slug into a decent display name
     words = [w for w in slug.split("-") if w]
     if not words:
         return None
+
+    # Titlecase each hyphen-word; keeps things readable without overfitting
     return " ".join(w.capitalize() for w in words)
 
 
@@ -164,7 +259,7 @@ def infer_campaign_name(
             if any(p.strip().lower() == gn_low for p in parens):
                 cleaned = PAREN_RE.sub("", t).strip()
 
-                # Key fix: don't treat "System (Group)" as a campaign
+                # Don't treat "System (Group)" as a campaign
                 if sys_low and cleaned.lower() == sys_low:
                     continue
                 if gn_low and cleaned.lower() == gn_low:
@@ -176,7 +271,6 @@ def infer_campaign_name(
     # 2) URL fallback (great for Giantslayer/Kingmaker/etc.)
     from_url = infer_campaign_from_url(url)
     if from_url:
-        # avoid returning just the system name again
         if sys_low and from_url.lower() == sys_low:
             pass
         else:
@@ -304,11 +398,14 @@ def extract_post_fields(html: str, url: str | None = None) -> PostExtract:
             yts.append(src)
     out.youtube_urls = sorted(set(yts)) if yts else None
 
-    # Group/System/Campaign inference (from known lists + page text + url)
+    # Group/System/Campaign inference + cleanup + alias normalization
     page_text = soup.get_text(" ", strip=True)
     out.group_name = infer_group_name(out.tags, page_text)
     out.system_name = infer_system_name(out.tags, page_text)
-    out.campaign_name = infer_campaign_name(out.tags, out.title, out.group_name, out.system_name, url)
+
+    raw_campaign = infer_campaign_name(out.tags, out.title, out.group_name, out.system_name, url)
+    cleaned_campaign = clean_campaign_name(raw_campaign)
+    out.campaign_name = normalize_campaign_name(cleaned_campaign)
 
     return out
 

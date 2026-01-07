@@ -25,18 +25,51 @@ def get_summary() -> StatsSummary:
     """
     Session heuristic:
       URL contains session-<number> (case-insensitive)
+
+    "All content" totals + with/missing duration counts exclude posts tagged:
+      - Journal / Journals
+      - Blog / Blogs
+
+    (This prevents blog/journal content from polluting the audio-runtime numbers.)
     """
     sql = """
+    with excluded as (
+      select url
+      from raw_posts
+      where exists (
+        select 1
+        from unnest(coalesce(tags, array[]::text[])) t(tag)
+        where lower(t.tag) in ('journal','journals','blog','blogs')
+      )
+    )
     select
       count(*)::int as total_posts,
-      count(*) filter (where duration_seconds is not null)::int as with_duration,
-      count(*) filter (where duration_seconds is null)::int as missing_duration,
 
-      coalesce(sum(duration_seconds), 0)::bigint as total_seconds_all,
-      coalesce(sum(duration_seconds) filter (where url ~* 'session-[0-9]+'), 0)::bigint as total_seconds_sessions,
+      count(*) filter (
+        where url not in (select url from excluded)
+          and duration_seconds is not null
+      )::int as with_duration,
 
-      coalesce(sum(duration_seconds) / 3600.0, 0)::float as total_hours_all,
-      coalesce(sum(duration_seconds) filter (where url ~* 'session-[0-9]+') / 3600.0, 0)::float as total_hours_sessions
+      count(*) filter (
+        where url not in (select url from excluded)
+          and duration_seconds is null
+      )::int as missing_duration,
+
+      coalesce(sum(duration_seconds) filter (
+        where url not in (select url from excluded)
+      ), 0)::bigint as total_seconds_all,
+
+      coalesce(sum(duration_seconds) filter (
+        where url ~* 'session-[0-9]+'
+      ), 0)::bigint as total_seconds_sessions,
+
+      coalesce(sum(duration_seconds) filter (
+        where url not in (select url from excluded)
+      ) / 3600.0, 0)::float as total_hours_all,
+
+      coalesce(sum(duration_seconds) filter (
+        where url ~* 'session-[0-9]+'
+      ) / 3600.0, 0)::float as total_hours_sessions
     from raw_posts;
     """
     with get_conn() as conn:
@@ -58,6 +91,7 @@ def get_summary() -> StatsSummary:
 def top_groups_by_hours(limit: int = 10) -> list[tuple[str, float, int]]:
     """
     Returns (group_name, hours, items_with_duration)
+    (sessions only)
     """
     sql = """
     select
@@ -81,6 +115,7 @@ def top_groups_by_hours(limit: int = 10) -> list[tuple[str, float, int]]:
 def top_authors_by_hours(limit: int = 10) -> list[tuple[str, float, int]]:
     """
     Returns (author, hours, items_with_duration)
+    (sessions only)
     """
     sql = """
     select
