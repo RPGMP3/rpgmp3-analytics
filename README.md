@@ -1,123 +1,113 @@
-# RPGMP3 Analytics (rpgstats)
+# RPGMP3 Analytics
 
-A small analytics pipeline for the RPGMP3 actual play archive.
+RPGMP3 Analytics is a command-line analytics pipeline for the RPGMP3 actual play archive. It ingests post URLs from a WordPress sitemap, crawls each post page, extracts and normalizes metadata, stores the results in Postgres, and produces terminal-based reports summarizing thousands of hours of tabletop RPG recordings.
 
-It ingests RPGMP3 post URLs from the WordPress post sitemap, crawls each post page, extracts useful metadata (duration, author, tags, group, system, campaign), stores everything in Postgres, and prints terminal reports showing totals and “top” rankings.
+---
 
-This project exists because podcast RSS feeds often only contain the most recent ~300 episodes, while the RPGMP3 archive spans thousands of posts and decades of content.
+## Motivation
 
-## What it does
+Podcast RSS feeds typically expose only the most recent few hundred episodes, which makes them unsuitable for analyzing long-running archives. RPGMP3 hosts decades of actual play content across many groups, systems, and campaigns, and understanding that history requires crawling and normalizing the full site rather than relying on podcast feeds alone.
 
-### Ingest
-- Reads URLs from the RPGMP3 WordPress post sitemap
-- Upserts them into Postgres (`raw_posts`)
+This project exists to answer questions such as:
 
-### Extract
-For each post URL, fetches the page HTML and attempts to extract:
-- Title
-- Author
-- Last modified time (from sitemap)
-- Tags/categories
-- Audio duration (from the embedded “Download (Duration: …)” line)
-- Group name (heuristic based on known group names)
-- System name (heuristic based on known systems)
-- Campaign name (heuristic + cleanup; optional alias mapping)
+- How many total hours of actual play exist in the archive?
+- Which groups, systems, and campaigns account for the most play time?
+- How does activity vary across contributors and game systems over time?
 
-### Report
-Outputs terminal stats including:
-- Total runtime (all audio content, excluding Journals/Blog content)
-- Total runtime (sessions only, heuristic)
-- Top groups/authors/systems/campaigns by total hours
-- Top group+system and group+campaign pairs
+The goal is to build a repeatable, inspectable analytics pipeline that works against real-world, imperfect data and can evolve as the site changes.
 
-## Example output
+---
 
-(Your totals will vary over time as the site grows.)
+## Quick Start
 
-- Total runtime (sessions only): **34 weeks** of continuous audio
-- Total runtime (all audio content, excluding Journals/Blog): **36 weeks** of continuous audio
+The Quick Start demonstrates the full pipeline end-to-end with minimal configuration.
 
-## Project layout
-
-- `src/rpgstats/cli.py`  
-  Typer CLI entrypoint
-- `src/rpgstats/crawl/sitemap.py`  
-  Sitemap ingestion
-- `src/rpgstats/crawl/extract_post.py`  
-  HTML extraction + heuristics (group/system/campaign, duration parsing)
-- `src/rpgstats/analytics/stats.py`  
-  SQL-backed reporting queries
-- `src/rpgstats/db/schema.sql`  
-  Database schema
-- `src/rpgstats/data/`  
-  Heuristic lists:
-  - `groups.txt`
-  - `systems.txt`
-  - `campaign_aliases.txt` (optional)
-
-## Requirements
+### Requirements
 
 - Python 3.12+
 - [`uv`](https://github.com/astral-sh/uv)
 - Docker (for Postgres)
-- A `DATABASE_URL` pointing to your Postgres database
+- A local Postgres database
 
-## Setup
+### Clone and install
 
-### 1) Clone and install
 ```bash
+git clone https://github.com/<your-username>/rpgmp3-analytics.git
+cd rpgmp3-analytics
 uv pip install -e .
 
-2) Run Postgres (Docker)
-Example (adjust as needed):
-
+## Start Postgres (Docker example)
 docker run --name rpgstats-postgres \
   -e POSTGRES_PASSWORD=postgres \
   -e POSTGRES_USER=postgres \
   -e POSTGRES_DB=rpgstats \
   -p 5432:5432 \
   -d postgres:16
-3) Configure environment
-export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/rpgstats"
-4) Initialize schema
 
+## Configure environment
+export DATABASE_URL="postgresql://postgres:postgres@localhost:5432/rpgstats"
+
+## Initialize the database schema
 uv run python -m rpgstats.cli db-init
 
-Usage
-Ingest URLs from the sitemap
+## Ingest the RPGMP3 post sitemap
+uv run python -m rpgstats.cli crawl-sitemap \
+  https://www.rpgmp3.com/post-sitemap.xml
 
-uv run python -m rpgstats.cli ingest-sitemap --sitemap-url "https://www.rpgmp3.com/post-sitemap.xml"
-
-Extract metadata from posts
+## Extract metadata from posts 
 Run extraction in batches until the queue is empty:
+uv run python -m rpgstats.cli extract-posts \
+  --limit 200 \
+  --sleep-ms 200 \
+  --until-empty
 
-uv run python -m rpgstats.cli extract-posts --limit 200 --sleep-ms 200 --until-empty
-
-Print stats report
-
+## View analytics
 uv run python -m rpgstats.cli stats --limit 15
-Notes on heuristics
-Sessions-only heuristic
-A post is considered “session-like” if the URL matches:
 
-session-<number> (case-insensitive)
+## Usage
+The Usage section documents advanced workflows and operational details beyond the initial run.
 
-This is used to generate the “sessions only” runtime and rankings.
+### Incremental extraction
+Extraction is designed to be incremental and idempotent. Each post is marked as attempted after extraction, which prevents infinite retry loops on posts that cannot be fully parsed. Extraction can safely be stopped and resumed at any time.
 
-Excluding Journals/Blog content from “all content” runtime
-Some posts are not audio episodes (journals, blog posts, guides, etc.). The “all content” runtime totals exclude any post tagged:
+Batch size and crawl delay are configurable to control load on the source site:
+uv run python -m rpgstats.cli extract-posts \
+  --limit 100 \
+  --sleep-ms 500
 
-Journals / Journal
+### Targeted re-extraction
+When extraction logic is improved or content on the site is updated, individual posts or subsets of posts can be reprocessed by clearing their extraction marker in the database and re-running extraction.
 
-Blog / Blogs
+Example: reprocess posts missing duration data.
+update raw_posts
+set extracted_at = null
+where duration_seconds is null;
 
-(These exclusions are applied in reporting.)
+Then:
 
-Campaign cleanup and aliasing
-Campaign names are inferred from tags / URL slug / title. A cleanup pass removes artifacts like “Session 44 2”.
+uv run python -m rpgstats.cli extract-posts --until-empty
 
-For rare naming/casing variations, you can add canonical mappings in:
+### Reporting and data quality
+The stats command reports both aggregate metrics and data quality indicators.
 
+“Sessions only” runtime is calculated using a URL heuristic (session-<number>) and represents authoritative playtime.
+
+“All content” runtime excludes posts tagged as Journals or Blog entries to avoid inflating totals with non-audio content.
+
+Missing data is surfaced explicitly rather than hidden.
+
+This makes it clear which numbers are definitive and which are best-effort.
+
+### Heuristics and normalization
+Group and system names are inferred using curated lists stored in:
+
+src/rpgstats/data/groups.txt
+
+src/rpgstats/data/systems.txt
+
+Campaign names are inferred from tags, URL slugs, and titles, then cleaned to remove recording artifacts such as session numbers or part suffixes.
+
+Known campaign naming variants are normalized using:
 src/rpgstats/data/campaign_aliases.txt
 
 Format:
@@ -127,14 +117,34 @@ Example:
 Curse Of The Crimson Throne => Curse of the Crimson Throne
 Inquisition Of Blood => Inquisition of Blood
 
-Future improvements
+This approach avoids brittle heuristics and keeps normalization explicit and auditable.
 
-Export reports to CSV/JSON
+## Contributing
+This project is structured to be easy to run and modify locally.
 
-Add a small web UI/dashboard
+### Local development
 
-Improve campaign inference using a curated tag export from WordPress
+Clone the repository, install it in editable mode, and run a local Postgres instance as described in the Quick Start. Most development work involves iterating on extraction logic or reporting queries.
 
-Add incremental scheduled ingestion/extraction
+After making changes to extraction, reset extraction markers for affected rows and re-run the extractor to validate the results.
 
+### Tests
 
+This project does not currently include an automated test suite. Validation is performed by re-running extraction and inspecting reporting output and data quality metrics.
+
+### Submitting changes
+
+If you would like to contribute:
+
+Fork the repository
+
+Create a feature branch from main
+
+Make focused, well-scoped changes
+
+Open a pull request against main
+
+Clear commit messages and small, reviewable changes are preferred.
+
+## Notes
+The analytics produced by this project reflect the current state of the RPGMP3 site and evolve as content and tagging change. The pipeline is designed to surface inconsistencies and make corrections explicit rather than silently discarding data.
